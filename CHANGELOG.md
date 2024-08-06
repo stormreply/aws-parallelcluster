@@ -7,6 +7,8 @@ CHANGELOG
 **ENHANCEMENTS**
 
 - Add support for custom actions on login nodes.
+- Allow DCV connection on login nodes.
+- Add support for ap-southeast-3 region.
 - Add new configuration `SharedStorage/EfsSettings/AccessPointId` to specify an optional EFS access point for a mount
 
 **BUG FIXES**

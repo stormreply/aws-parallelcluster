@@ -54,7 +54,7 @@ from jinja2 import FileSystemLoader
 from jinja2.sandbox import SandboxedEnvironment
 from troposphere import Ref, Sub, Template, ec2, resourcegroups
 from troposphere.ec2 import PlacementGroup
-from troposphere.efs import FileSystem as EFSFileSystem
+from troposphere.efs import FileSystem as EFSFileSystem, AccessPoint as EFSAccessPoint
 from troposphere.efs import MountTarget
 from troposphere.fsx import (
     ClientConfigurations,
@@ -213,6 +213,14 @@ def pytest_addoption(parser):
     parser.addoption(
         "--proxy-stack",
         help="Name of CFN stack providing a Proxy environment.",
+    )
+    parser.addoption(
+        "--build-image-roles-stack",
+        help="Name of CFN stack providing the build image permissions.",
+    )
+    parser.addoption(
+        "--api-stack",
+        help="Name of CFN stack providing the ParallelCluster API infrastructure.",
     )
 
 
@@ -420,38 +428,44 @@ def api_server_factory(
     api_servers = {}
 
     def _api_server_factory(server_region):
-        api_stack_name = generate_stack_name("integ-tests-api", request.config.getoption("stackname_suffix"))
-
-        params = [
-            {"ParameterKey": "EnableIamAdminAccess", "ParameterValue": "true"},
-            {"ParameterKey": "CreateApiUserRole", "ParameterValue": "false"},
-        ]
-        if api_definition_s3_uri:
-            params.append({"ParameterKey": "ApiDefinitionS3Uri", "ParameterValue": api_definition_s3_uri})
-        if policies_uri:
-            params.append({"ParameterKey": "PoliciesTemplateUri", "ParameterValue": policies_uri})
-        if resource_bucket:
-            params.append({"ParameterKey": "CustomBucket", "ParameterValue": resource_bucket})
-
-        template = (
-            api_infrastructure_s3_uri
-            or f"https://{resource_bucket}.s3.{server_region}.amazonaws.com"
-            f"{'.cn' if server_region.startswith('cn') else ''}"
-            f"/parallelcluster/{get_installed_parallelcluster_version()}/api/parallelcluster-api.yaml"
-        )
-        if server_region not in api_servers:
-            logging.info(f"Creating API Server stack: {api_stack_name} in {server_region} with template {template}")
-            stack = CfnStack(
-                name=api_stack_name,
-                region=server_region,
-                parameters=params,
-                capabilities=["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"],
-                template=template,
-            )
-            cfn_stacks_factory.create_stack(stack)
-            api_servers[server_region] = stack
+        option = "api_stack"
+        if request.config.getoption(option):
+            api_stack_name = request.config.getoption(option)
+            logging.info(f"Using existing ParallelCluster API stack in {server_region}: {api_stack_name}")
+            api_servers[server_region] = CfnStack(name=api_stack_name, region=server_region, template=None)
         else:
-            logging.info(f"Found cached API Server stack: {api_stack_name} in {server_region}")
+            api_stack_name = generate_stack_name("integ-tests-api", request.config.getoption("stackname_suffix"))
+
+            params = [
+                {"ParameterKey": "EnableIamAdminAccess", "ParameterValue": "true"},
+                {"ParameterKey": "CreateApiUserRole", "ParameterValue": "false"},
+            ]
+            if api_definition_s3_uri:
+                params.append({"ParameterKey": "ApiDefinitionS3Uri", "ParameterValue": api_definition_s3_uri})
+            if policies_uri:
+                params.append({"ParameterKey": "PoliciesTemplateUri", "ParameterValue": policies_uri})
+            if resource_bucket:
+                params.append({"ParameterKey": "CustomBucket", "ParameterValue": resource_bucket})
+
+            template = (
+                api_infrastructure_s3_uri
+                or f"https://{resource_bucket}.s3.{server_region}.amazonaws.com"
+                f"{'.cn' if server_region.startswith('cn') else ''}"
+                f"/parallelcluster/{get_installed_parallelcluster_version()}/api/parallelcluster-api.yaml"
+            )
+            if server_region not in api_servers:
+                logging.info(f"Creating API Server stack: {api_stack_name} in {server_region} with template {template}")
+                stack = CfnStack(
+                    name=api_stack_name,
+                    region=server_region,
+                    parameters=params,
+                    capabilities=["CAPABILITY_NAMED_IAM", "CAPABILITY_AUTO_EXPAND"],
+                    template=template,
+                )
+                cfn_stacks_factory.create_stack(stack)
+                api_servers[server_region] = stack
+            else:
+                logging.info(f"Found cached API Server stack: {api_stack_name} in {server_region}")
 
         return api_servers[server_region]
 
@@ -1763,6 +1777,32 @@ def efs_stack_factory(cfn_stacks_factory, request, region, vpc_stack):
         return [stack.cfn_resources[f"{file_system_resource_name}{i}"] for i in range(num)]
 
     yield create_efs
+
+    if not request.config.getoption("no_delete"):
+        for stack in created_stacks:
+            cfn_stacks_factory.delete_stack(stack.name, region)
+
+@pytest.fixture(scope="class")
+def efs_access_point_stack_factory(cfn_stacks_factory, request, region, vpc_stack):
+    """EFS stack contains a single efs and a single access point resource."""
+    created_stacks = []
+
+    def create_access_points(efs_fs_id, num=1):
+        ap_template = Template()
+        ap_template.set_version("2010-09-09")
+        ap_template.set_description("Access Point stack created for testing existing EFS wtith Access points")
+        access_point_resource_name = "AccessPointResourceResource"
+        for i in range(num):
+            access_point = EFSAccessPoint(f"{access_point_resource_name}{i}")
+            access_point.FileSystemId = efs_fs_id
+            ap_template.add_resource(access_point)
+        stack_name = generate_stack_name("integ-tests-efs-ap", request.config.getoption("stackname_suffix"))
+        stack = CfnStack(name=stack_name, region=region, template=ap_template.to_json())
+        cfn_stacks_factory.create_stack(stack)
+        created_stacks.append(stack)
+        return [stack.cfn_resources[f"{access_point_resource_name}{i}"] for i in range(num)]
+
+    yield create_access_points
 
     if not request.config.getoption("no_delete"):
         for stack in created_stacks:
